@@ -1,0 +1,221 @@
+import os
+import glob
+from datetime import datetime
+
+try:
+    import psycopg2
+    from psycopg2 import sql
+except ImportError:
+    raise ImportError("psycopg2 is required. Run 'python -m pip install psycopg2-binary'")
+
+try:
+    import openpyxl
+except ImportError:
+    raise ImportError("openpyxl is required. Run 'python -m pip install openpyxl'")
+
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    def load_dotenv(): return None
+
+load_dotenv()
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+ROOT_DIR = os.path.abspath(os.path.join(SCRIPT_DIR, os.pardir))
+TEMPLATES_DIR = os.path.join(ROOT_DIR, "templates")
+
+def get_db_connection():
+    return psycopg2.connect(
+        host=os.getenv("DB_HOST", "localhost"),
+        port=os.getenv("DB_PORT", 5432),
+        dbname=os.getenv("DB_NAME", "CalTest"),
+        user=os.getenv("DB_USER", "postgres"),
+        password=os.getenv("DB_PASSWORD")
+    )
+
+def clean_header(header_val):
+    """Converts rough Excel headers into clean, database-safe column names."""
+    if header_val is None:
+        return None
+    # Lowercase, replace spaces/slashes with underscores, drop parentheses
+    cleaned = str(header_val).strip().lower()
+    cleaned = cleaned.replace(" ", "_").replace("/", "_").replace("-", "_")
+    for char in ["(", ")", "[", "]"]:
+        cleaned = cleaned.replace(char, "")
+    return cleaned
+
+
+def make_unique_headers(raw_headers):
+    """Ensure every cleaned header name is unique so SQL table creation succeeds."""
+    cleaned_headers = []
+    seen = {}
+
+    for header in raw_headers:
+        if header is None:
+            continue
+
+        base_name = clean_header(header) or "column"
+        count = seen.get(base_name, 0)
+        seen[base_name] = count + 1
+
+        if count:
+            cleaned_headers.append(f"{base_name}_{count}")
+        else:
+            cleaned_headers.append(base_name)
+
+    return cleaned_headers
+
+def parse_date(val):
+    if val is None:
+        return None
+    if hasattr(val, "date"):
+        return val.date()
+    for fmt in ("%m/%d/%Y", "%Y-%m-%d", "%m-%d-%Y", "%m/%d/%y", "%Y-%m-%d %H:%M:%S"):
+        try:
+            return datetime.strptime(str(val).strip(), fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+def resolve_primary_key_columns(cleaned_headers):
+    """Use serial_number plus the first date-like column found in the workbook, if any."""
+    if "serial_number" not in cleaned_headers:
+        return []
+
+    date_candidates = []
+    for header in cleaned_headers:
+        if header is None:
+            continue
+        lowered = header.lower()
+        if lowered in {"date_calibrated", "calibration_date", "date"} or lowered.endswith("_date") or lowered.startswith("date_"):
+            date_candidates.append(header)
+
+    if date_candidates:
+        return ["serial_number", date_candidates[0]]
+    return ["serial_number"]
+
+
+def process_file(filepath, conn):
+    """Reads any calibration workbook, auto-creates its table, and UPSERTs data."""
+    filename = os.path.basename(filepath)
+    # Generate clean table name from the file name (e.g., thread_ring_gages)
+    table_name = os.path.splitext(filename)[0].strip().lower().replace(" ", "_")
+    
+    wb = openpyxl.load_workbook(filepath, data_only=True)
+    if "MAIN_INPUT" not in wb.sheetnames:
+        print(f"  ✕ Skipped {filename}: Missing 'MAIN_INPUT' worksheet tab.")
+        return
+        
+    ws = wb["MAIN_INPUT"]
+    
+    # 1. Dynamically read Row 1 headers
+    raw_headers = [cell.value for cell in ws[1]]
+    cleaned_headers = make_unique_headers(raw_headers)
+    
+    if "serial_number" not in cleaned_headers:
+        print(f"  ✕ Skipped {filename}: Header row missing required 'serial_number' cell identifier.")
+        return
+
+    cur = conn.cursor()
+
+    pk_columns = resolve_primary_key_columns(cleaned_headers)
+    pk_columns_quoted = [f'"{col}"' for col in pk_columns]
+    conflict_target = ", ".join(pk_columns_quoted)
+    pk_date_column = pk_columns[1] if len(pk_columns) > 1 else None
+    
+# 2. Dynamic DDL: Automatically build the table if it does not exist yet!
+    column_definitions = []
+    for header in cleaned_headers:
+        if "date" in header:
+            column_definitions.append(f'"{header}" DATE')
+        elif header in ["a_1", "a_2", "a_3", "b_1", "b_2", "b_3", "c_1", "c_2", "c_3", 
+                        "a_trial_1", "a_trial_2", "a_trial_3", "b_trial_1", "b_trial_2", "b_trial_3", "c_trial_1", "c_trial_2", "c_trial_3"]:
+            column_definitions.append(f'"{header}" NUMERIC')
+        else:
+            # All other columns default to text, including serial_number
+            column_definitions.append(f'"{header}" TEXT')
+            
+    column_definitions.append('"updated_at" TIMESTAMP DEFAULT NOW()')
+
+    create_table_query = f"""
+        CREATE TABLE IF NOT EXISTS public."{table_name}" (
+            {", ".join(column_definitions)},
+            PRIMARY KEY ({conflict_target})
+        );
+    """
+    cur.execute(create_table_query)
+    conn.commit()
+
+    # 3. Read and insert actual rows with updated UPSERT logic
+    success_count = 0
+    sn_index = cleaned_headers.index("serial_number")
+    
+    for row_idx, row in enumerate(ws.iter_rows(min_row=2, values_only=True), start=2):
+        if not row or len(row) <= sn_index or row[sn_index] is None or str(row[sn_index]).strip() == "":
+            continue
+            
+        row_values = list(row[:len(cleaned_headers)])
+        
+        for idx, header in enumerate(cleaned_headers):
+            val = row_values[idx]
+            if "date" in header:
+                row_values[idx] = parse_date(val)
+            elif val is not None:
+                row_values[idx] = str(val).strip()
+
+        insert_cols = ", ".join([f'"{h}"' for h in cleaned_headers])
+        placeholders = ", ".join(["%s"] * len(cleaned_headers))
+        
+        # Overwrite assignments update EVERYTHING except the primary key columns.
+        ignored_pk_columns = {"serial_number"}
+        if pk_date_column:
+            ignored_pk_columns.add(pk_date_column)
+        update_assignments = ", ".join([f'"{h}" = EXCLUDED."{h}"' for h in cleaned_headers if h not in ignored_pk_columns])
+        
+        upsert_query = f"""
+            INSERT INTO public."{table_name}" ({insert_cols}, updated_at)
+            VALUES ({placeholders}, NOW())
+            ON CONFLICT ({conflict_target}) DO UPDATE SET
+                {update_assignments},
+                updated_at = NOW();
+        """
+        
+        try:
+            cur.execute(upsert_query, row_values)
+            conn.commit()
+            success_count += 1
+        except Exception as row_error:
+            conn.rollback()
+            print(f"  ✕ Row {row_idx} Sync Failed in {table_name}: {row_error}")
+
+    print(f"  ✓ Processed '{filename}' ➔ Table '{table_name}' updated with {success_count} records.")
+    cur.close()
+
+
+def main():
+    print("--- ^-^ Starting Master Dynamic Data Warehousing Pipeline ^-^ ---")
+    try:
+        conn = get_db_connection()
+    except Exception as e:
+        print(f"[FATAL CONNECTION ERROR]: Verify local Postgres configurations.\nDetail: {e}")
+        return
+
+    # Automatically scans your template directory for ANY workbook matching calibration*.xlsx
+    target_files = glob.glob(os.path.join(TEMPLATES_DIR, "*.xlsx"))
+    target_files = [path for path in target_files if not os.path.basename(path).startswith("~$")]
+    
+    if not target_files:
+        print(f"[WARNING] No templates found matching 'calibration*.xlsx' in {TEMPLATES_DIR}")
+        conn.close()
+        return
+
+    print(f"Found {len(target_files)} target template matrices to synchronize...")
+    for filepath in sorted(target_files):
+        process_file(filepath, conn)
+
+    conn.close()
+    print("\n--- ^-^ Master Pipeline Executed Successfully! ^-^ ---")
+
+if __name__ == "__main__":
+    main()
