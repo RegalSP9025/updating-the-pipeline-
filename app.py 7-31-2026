@@ -1,0 +1,211 @@
+import os
+from datetime import datetime
+
+import streamlit as st
+import psycopg2
+from psycopg2 import sql
+from psycopg2.extras import RealDictCursor
+from dotenv import load_dotenv
+import pandas as pd
+
+load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), ".env"))
+
+st.set_page_config(page_title="Regal Calibration Registry", layout="wide")
+
+st.title(" ^‿^ Regal Calibration Audit System ^‿^")
+st.markdown("### Search and verify asset calibration logs instantaneously.")
+st.divider()
+
+@st.cache_resource
+def init_connection():
+    return psycopg2.connect(
+        host=os.getenv("DB_HOST", "localhost"),
+        port=os.getenv("DB_PORT", 5432),
+        dbname=os.getenv("DB_NAME", "CalTest"),
+        user=os.getenv("DB_USER", "postgres"),
+        password=os.getenv("DB_PASSWORD")
+    )
+
+try:
+    conn = init_connection()
+except Exception as e:
+    st.error(f"❌ Database Connection Failure: {e}")
+    st.stop()
+
+def get_all_calibration_tables():
+    query = """
+        SELECT table_name 
+        FROM information_schema.tables 
+        WHERE table_schema = 'public'
+        ORDER BY table_name;
+    """
+    with conn.cursor() as cur:
+        cur.execute(query)
+        tables = [row[0] for row in cur.fetchall()]
+    return sorted(tables)
+
+def get_table_date_column(table_name):
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = 'public' AND table_name = %s
+            ORDER BY ordinal_position;
+            """,
+            (table_name,),
+        )
+        columns = [row[0] for row in cur.fetchall()]
+
+    if not columns:
+        return None
+
+    for column_name in columns:
+        lowered = column_name.lower()
+        if lowered in {"date_calibrated", "calibration_date", "date"} or lowered.endswith("_date") or lowered.startswith("date_"):
+            return column_name
+
+    for column_name in columns:
+        if "date" in column_name.lower():
+            return column_name
+
+    return None
+
+refresh_tables = st.sidebar.button("🔄 Refresh asset list")
+if refresh_tables:
+    st.session_state["available_tables"] = get_all_calibration_tables()
+
+if "available_tables" not in st.session_state:
+    st.session_state["available_tables"] = get_all_calibration_tables()
+
+available_tables = st.session_state["available_tables"]
+
+if not available_tables:
+    st.warning("⚠️ No active asset tables found in the 'CalTest' public schema. Run your import script first.")
+    st.stop()
+
+target_table = st.selectbox(
+    "Select Asset Category:",
+    options=available_tables,
+    format_func=lambda x: x.replace("calibration_", "").replace("_", " ").upper()
+)
+
+search_serial = st.text_input("🔍 Enter Gauge Serial Number to Audit:", placeholder="e.g. 95984").strip()
+
+if search_serial:
+    date_column = get_table_date_column(target_table)
+
+    if not date_column:
+        st.warning(f"⚠️ No usable date column found for table '{target_table}'.")
+        st.stop()
+
+    date_query = sql.SQL(
+        "SELECT {field} FROM public.{table} WHERE serial_number = %s ORDER BY {field} DESC;"
+    ).format(
+        field=sql.Identifier(date_column),
+        table=sql.Identifier(target_table),
+    )
+
+    with conn.cursor() as cur:
+        cur.execute(date_query, (search_serial,))
+        all_dates = [row[0] for row in cur.fetchall()]
+
+    if all_dates:
+        formatted_dates = [d.strftime("%Y-%m-%d") for d in all_dates]
+        selected_date_str = st.selectbox("📅 Select Calibration Historical Record to View:", options=formatted_dates)
+        selected_date = datetime.strptime(selected_date_str, "%Y-%m-%d").date()
+
+        query = sql.SQL(
+            "SELECT * FROM public.{table} WHERE serial_number = %s AND {field} = %s;"
+        ).format(
+            field=sql.Identifier(date_column),
+            table=sql.Identifier(target_table),
+        )
+
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(query, (search_serial, selected_date))
+            result = cur.fetchone()
+            
+        if result:
+            st.success(f"✅ Record Found for Serial Number: {search_serial} [{selected_date_str}]")
+            
+            data_dict = {k.lower(): v for k, v in result.items()}
+            
+            # --- METADATA CLASSIFICATION ---
+            # Set of keys classified as "Asset Identity"
+            IDENTITY_KEYS = {
+                'serial_number', 'date_calibrated', 'calibration_date', 'inspector', 
+                'calibrated_by', 'inspected', 'gage_type', 'type', 'gauge_type', 
+                'manufacturer', 'mfg', 'gauge_manufacturer', 'model_number', 'model', 
+                'gauge_desc', 'description', 'gauge_description', 'desc', 'graduation', 
+                'size', 'nominal_mounting_hole_gage_pin_size'
+            }
+
+            # Set of keys classified as "System Parameters & Status"
+            PARAM_KEYS = {
+                'procedure_used', 'procedure_name', 'sn_gage_used_to_cal', 
+                'sn_of_gage_used_to_calibrate', 'serial_number_calibration',
+                'finding', 'status', 'next_due_date', 'next_calibration_due', 'updated_at'
+            }
+
+            ALL_METADATA_KEYS = IDENTITY_KEYS.union(PARAM_KEYS)
+
+            col1, col2 = st.columns(2)
+            
+            # 📋 1. DYNAMIC ASSET IDENTITY DETAILS
+            with col1:
+                st.subheader("📋 Asset Identity Details")
+                found_identity = False
+
+                for key, val in data_dict.items():
+                    if key in IDENTITY_KEYS and val not in (None, ""):
+                        # Clean key for human readable display
+                        display_name = key.replace("_", " ").title()
+                        st.write(f"**{display_name}:** {val}")
+                        found_identity = True
+                
+                if not found_identity:
+                    st.info("No specific asset identity parameters found.")
+                
+            # 🔬 2. DYNAMIC CALIBRATION SYSTEM PARAMETERS
+            with col2:
+                st.subheader("🔬 Calibration System Parameters")
+                
+                # Check for overall status metric display first
+                status_val = None
+                for status_key in ['finding', 'status']:
+                    if data_dict.get(status_key) not in (None, ""):
+                        status_val = str(data_dict[status_key]).upper()
+                        break
+
+                for key, val in data_dict.items():
+                    if key in PARAM_KEYS and key not in ['finding', 'status'] and val not in (None, ""):
+                        display_name = key.replace("_", " ").title()
+                        st.write(f"**{display_name}:** {val}")
+
+                # Display Status Metric Badge dynamically if present
+                if status_val:
+                    if any(word in status_val for word in ["READY", "PASS", "ACCEPT"]):
+                        st.metric(label="ASSET OPERATIONAL STATUS", value=status_val, delta="Passed Inspection")
+                    else:
+                        st.metric(label="ASSET OPERATIONAL STATUS", value=status_val, delta="Requires Attention", delta_color="inverse")
+                else:
+                    st.metric(label="ASSET OPERATIONAL STATUS", value="READY", delta="Passed Inspection")
+
+            # 📊 3. DYNAMIC MEASUREMENT MATRIX (Trial Run Data)
+            # Anything not explicitly assigned to top-level metadata will land here!
+            measurement_data = {}
+            for col_name, col_value in data_dict.items():
+                if col_name not in ALL_METADATA_KEYS and col_value not in (None, ""):
+                    display_header = col_name.replace("_", " ").title()
+                    measurement_data[display_header] = col_value
+
+            if measurement_data:
+                st.divider()
+                st.subheader("📊 Inspection Readings & Measurements Matrix")
+                
+                meas_df = pd.DataFrame(list(measurement_data.items()), columns=["Inspection Feature / Nominal", "Recorded Value"])
+                st.dataframe(meas_df, use_container_width=True, hide_index=True)
+
+    else:
+        st.warning(f"⚠️ No active calibration history found for Serial Number: '{search_serial}'")
